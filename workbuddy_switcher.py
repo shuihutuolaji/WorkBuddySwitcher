@@ -70,6 +70,7 @@ def log_file_write(msg: str) -> None:
 # ---------------------------------------------------------------- 配置
 
 DEFAULT_OPTIONS = {
+    "theme": "浅色",             # 外观主题：浅色 / 深色 / 跟随系统
     "exe_path": "",
     "share_sidebar": True,      # 复制侧栏会话列表缓存
     "share_automations": False, # 定时任务 owner 一并改写（默认关）
@@ -82,6 +83,7 @@ DEFAULT_OPTIONS = {
     "credit_guard_threshold": 100,  # 触发阈值：当前账号可用积分低于该值时切换
     "credit_guard_autoresume": False,      # 切换后自动续跑最近会话（CDP 驱动）
     "credit_guard_resume_prompt": "继续",   # 续跑指令（会话上下文已随迁移带过去）
+    "growth_optional": False,     # 可选玩法：旅行/盲盒/能量开 Buddy/补登（默认关闭）
 }
 
 
@@ -97,6 +99,68 @@ def load_config() -> dict:
 def save_config(cfg: dict) -> None:
     TOOL_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ---------------------------------------------------------------- 外观主题
+
+THEME_NAMES = ("浅色", "深色", "跟随系统")
+
+PALETTES = {
+    "light": {
+        "bg": "#f5f6f8", "fg": "#1f2328", "muted": "#6b7280",
+        "field": "#ffffff", "border": "#d8dce3",
+        "btn": "#eef0f4", "btn_hover": "#e3e7ed", "btn_active": "#d6dbe3",
+        "tab": "#e6e9ee", "sel_bg": "#cfe3ff", "sel_fg": "#1f2328",
+        "canvas": "#ffffff", "grid": "#ececec", "heat_empty": "#ececec",
+        "accent": "#2f81f7", "accent2": "#e67e22",
+        "warn": "#c0392b", "mid": "#d68910", "link": "#2471a3", "ok": "#0a7a52",
+        "log_bg": "#ffffff",
+    },
+    "dark": {
+        "bg": "#1e2128", "fg": "#e6e8ec", "muted": "#9aa3b2",
+        "field": "#262a32", "border": "#3a4050",
+        "btn": "#2f343e", "btn_hover": "#3a414d", "btn_active": "#464e5c",
+        "tab": "#2a2f38", "sel_bg": "#33507a", "sel_fg": "#ffffff",
+        "canvas": "#23262d", "grid": "#333842", "heat_empty": "#2c313a",
+        "accent": "#4c9aff", "accent2": "#f5a623",
+        "warn": "#ff7b72", "mid": "#ffb84d", "link": "#6cb6ff", "ok": "#3ddc97",
+        "log_bg": "#23262d",
+    },
+}
+
+CUR_PAL = dict(PALETTES["light"])
+
+
+def palette() -> dict:
+    """当前主题调色板（画布等 tk 原生控件用）。"""
+    return CUR_PAL
+
+
+def system_prefers_dark() -> bool:
+    try:
+        import winreg
+        with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            v, _ = winreg.QueryValueEx(k, "AppsUseLightTheme")
+        return int(v) == 0
+    except (OSError, ValueError):
+        return False
+
+
+def resolve_theme(name: str) -> str:
+    if name == "深色":
+        return "dark"
+    if name == "跟随系统":
+        return "dark" if system_prefers_dark() else "light"
+    return "light"
+
+
+def hex_mix(c1: str, c2: str, t: float) -> str:
+    """两个 #rrggbb 颜色按 t（0~1）线性混合。"""
+    a = tuple(int(c1[i:i + 2], 16) for i in (1, 3, 5))
+    b = tuple(int(c2[i:i + 2], 16) for i in (1, 3, 5))
+    return "#" + "".join(f"{int(a[i] + (b[i] - a[i]) * t):02x}" for i in range(3))
 
 
 # ---------------------------------------------------------------- 登录态文件
@@ -909,7 +973,7 @@ def refresh_all_tokens(sw, log=print) -> bool:
     return ok_all
 
 
-def wb_api(profile: Profile, path: str, payload=None, prefix='/v2', log=print):
+def wb_api(profile: Profile, path: str, payload=None, prefix='/v2', log=print, method='POST'):
     """调用 WorkBuddy 云端接口。返回 (ok, data_or_msg)。"""
     import urllib.request
     import urllib.error
@@ -917,9 +981,10 @@ def wb_api(profile: Profile, path: str, payload=None, prefix='/v2', log=print):
     if not r:
         return False, "无法解密令牌"
     uid, token = r
-    body = json.dumps(payload or {}).encode('utf-8')
+    method = method.upper()
+    body = None if method == 'GET' else json.dumps(payload or {}).encode('utf-8')
     req = urllib.request.Request(
-        f"{WB_ENDPOINT}{prefix}{path}", data=body, method='POST',
+        f"{WB_ENDPOINT}{prefix}{path}", data=body, method=method,
         headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {token}',
                  'X-User-Id': uid, 'Accept-Language': 'zh',
                  # 网关会按 UA 拦截非浏览器客户端（Python-urllib 直接 403）
@@ -976,6 +1041,288 @@ def daily_checkin(profile: Profile, log=print):
             m2 = str(data2)
             results.append("活动已签" if ('已签' in m2 or '1001' in m2) else f"活动签到：{m2}")
     return True, "；".join(results)
+
+
+# ---------------------------------------------------------------- 成长中心
+
+def _growth_field(data, key, default=None):
+    """读取可能被 data/result 再包一层的数据字段。"""
+    if isinstance(data, dict):
+        value = data.get(key)
+        if value is not None:
+            return value
+        for wrapper in ('data', 'result'):
+            nested = data.get(wrapper)
+            if isinstance(nested, dict):
+                value = _growth_field(nested, key)
+                if value is not None:
+                    return value
+    return default
+
+
+def _growth_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _growth_makeup_candidates(streak_data, heatmap_data):
+    """只从服务端日历选当月已发生且确认断登的一天，不推测缺失日期。"""
+    def parse_day(value):
+        if not isinstance(value, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+            raise ValueError('补登日期格式无效')
+        return datetime.strptime(value, '%Y-%m-%d').date()
+
+    today_obj = _growth_field(heatmap_data, 'today')
+    streak_obj = _growth_field(streak_data, 'streak')
+    cells = _growth_field(heatmap_data, 'cells')
+    if not isinstance(today_obj, dict) or not isinstance(streak_obj, dict) or not isinstance(cells, list):
+        raise ValueError('补登日历或连登状态格式无效')
+    today = parse_day(today_obj.get('date'))
+    launch = parse_day(_growth_field(streak_data, 'launch_date'))
+    start = max(today.replace(day=1), launch, datetime(2026, 6, 17).date())
+    made_up = streak_obj.get('makeup_dates', [])
+    if not isinstance(made_up, list):
+        raise ValueError('已补登记录格式无效')
+    made_up = {parse_day(value) for value in made_up}
+    scores = {}
+    for cell in cells:
+        if not isinstance(cell, dict):
+            raise ValueError('活跃日历记录格式无效')
+        day = parse_day(cell.get('date'))
+        score = cell.get('score')
+        if type(score) not in (int, float) or score < 0:
+            raise ValueError('活跃日历分数无效')
+        if day in scores and scores[day] != score:
+            raise ValueError('活跃日历同一日期的记录冲突')
+        scores[day] = score
+    return sorted((day.isoformat() for day, score in scores.items()
+                   if start <= day < today and score == 0 and day not in made_up), reverse=True)
+
+
+def growth_center(profile: Profile, optional=False, log=print):
+    """执行成长中心任务；optional=False 时不会请求任何可选玩法接口。"""
+    from urllib.parse import quote
+
+    base = '/activity/growth'
+    parts = []
+    ok_all = True
+    travel_state = None
+    daily_limit = False
+
+    def get(path):
+        return wb_api(profile, base + path, prefix='/v2', log=log, method='GET')
+
+    def post(path, payload=None):
+        return wb_api(profile, base + path, payload=payload or {}, prefix='/v2', log=log)
+
+    def fail(label, detail):
+        nonlocal ok_all
+        ok_all = False
+        parts.append(f'{label}失败：{detail}')
+
+    # 稳妥版：只领取已经抵达的旅行礼物，不主动派出。
+    try:
+        ok, data = get('/buddy/travel/status')
+        if not ok:
+            fail('查询旅行状态', data)
+        else:
+            travel_state = _growth_field(data, 'state')
+            daily_limit = bool(_growth_field(data, 'daily_limit_reached', False))
+            if travel_state == 'arrived':
+                record_id = _growth_field(data, 'record_id')
+                if not record_id:
+                    fail('领取旅行礼物', '响应缺少 record_id')
+                else:
+                    claimed, result = post('/buddy/travel/claim', {'record_id': record_id})
+                    if claimed:
+                        travel_state = 'idle'
+                        reward = _growth_field(result, 'reward_credit')
+                        parts.append('已领取旅行礼物' +
+                                     (f'（+{_growth_int(reward)} 积分）' if reward is not None else ''))
+                    else:
+                        fail('领取旅行礼物', result)
+            elif travel_state not in ('idle', 'traveling'):
+                fail('识别旅行状态', repr(travel_state))
+    except Exception as e:  # noqa: BLE001
+        fail('旅行模块', f'{type(e).__name__}: {e}')
+
+    # 稳妥版：接取未接任务，且只领取服务器明确标记 completed 的奖励。
+    try:
+        ok, data = get('/tasks')
+        if not ok:
+            fail('查询任务列表', data)
+        else:
+            tasks = _growth_field(data, 'tasks', [])
+            if not isinstance(tasks, list):
+                raise ValueError('任务列表格式无效')
+            tasks = [t for t in tasks if isinstance(t, dict)]
+            titles = {t.get('task_code'): str(t.get('title') or t.get('task_code')) for t in tasks}
+            pending = [t.get('task_code') for t in tasks
+                       if t.get('task_code') and not t.get('locked')
+                       and t.get('accept_status') == 'not_accepted']
+            for i in range(0, len(pending), 20):
+                batch = pending[i:i + 20]
+                accepted, result = post('/tasks/accept', {'task_codes': batch})
+                if not accepted:
+                    fail('接取任务', result)
+                    continue
+                results = _growth_field(result, 'results')
+                if not isinstance(results, list):
+                    parts.append(f'已接取 {len(batch)} 个未接任务')
+                    continue
+                count = 0
+                for item in results:
+                    if not isinstance(item, dict):
+                        continue
+                    code = item.get('task_code')
+                    title = titles.get(code, str(code))
+                    if item.get('status') == 'error':
+                        fail(f'接取任务「{title}」', item.get('message') or '服务端拒绝')
+                    else:
+                        count += 1
+                if count:
+                    parts.append(f'已接取 {count} 个未接任务')
+            for task in tasks:
+                if task.get('locked') or task.get('accept_status') != 'completed':
+                    continue
+                code = task.get('task_code')
+                if not code:
+                    continue
+                title = titles.get(code, str(code))
+                claimed, result = post(f'/tasks/{quote(str(code), safe="")}/claim')
+                if not claimed:
+                    fail(f'领取任务奖励「{title}」', result)
+                elif not _growth_field(result, 'already_claimed', False):
+                    credit = _growth_int(_growth_field(result, 'credit'))
+                    energy = _growth_int(_growth_field(result, 'energy'))
+                    reward = []
+                    if credit:
+                        reward.append(f'+{credit} 积分')
+                    if energy:
+                        reward.append(f'+{energy} 能量')
+                    parts.append(f'已领取任务奖励「{title}」' +
+                                 (f'（{"，".join(reward)}）' if reward else ''))
+    except Exception as e:  # noqa: BLE001
+        fail('任务模块', f'{type(e).__name__}: {e}')
+
+    # 可选玩法：每轮最多补登最近的一天；关闭时不查询连登和日历。
+    if optional:
+        try:
+            ok, streak = get('/streak')
+            if not ok:
+                fail('查询补登状态', streak)
+            else:
+                cards_obj = _growth_field(streak, 'makeup_cards')
+                cards = _growth_int(cards_obj.get('balance') if isinstance(cards_obj, dict) else cards_obj)
+                if cards > 0:
+                    ok, heatmap = get('/heatmap')
+                    if not ok:
+                        fail('查询补登日历', heatmap)
+                    else:
+                        dates = _growth_makeup_candidates(streak, heatmap)
+                        if dates:
+                            used, result = post('/makeup-cards/use', {'target_date': dates[0]})
+                            if used:
+                                parts.append(f'已补登 {dates[0]}')
+                            else:
+                                fail(f'补登 {dates[0]}', result)
+        except Exception as e:  # noqa: BLE001
+            fail('补登模块', f'{type(e).__name__}: {e}')
+
+    # 稳妥版：服务端显示已解锁且未领取时，兑换对应连登档位。
+    try:
+        ok, data = get('/redeem/summary')
+        if not ok:
+            fail('查询连登兑换', data)
+        else:
+            for tier, status_key, label in (('7d', 'starter', '入门'),
+                                            ('14d', 'advanced', '进阶'),
+                                            ('28d', 'legendary', '巅峰')):
+                status = _growth_field(data, status_key + '_status')
+                if not isinstance(status, str) or status in ('claimed', 'locked'):
+                    continue
+                redeemed, result = post('/redeem', {'tier': tier, 'client_token': f'u-{uuid.uuid4()}'})
+                if not redeemed:
+                    message = str(result)
+                    if '天数不足' in message or 'not unlocked' in message.lower():
+                        parts.append(f'连登兑换「{label}」尚未解锁')
+                    else:
+                        fail(f'连登兑换「{label}」', result)
+                    continue
+                reward = []
+                for key, name in (('credit_granted', '积分'), ('energy_granted', '能量'),
+                                  ('cards_granted', '补登卡'), ('chances_granted', '次抽奖')):
+                    amount = _growth_int(_growth_field(result, key))
+                    if amount:
+                        reward.append(f'+{amount} {name}')
+                parts.append(f'已兑换连登奖励「{label}」' +
+                             (f'（{"，".join(reward)}）' if reward else ''))
+    except Exception as e:  # noqa: BLE001
+        fail('连登兑换模块', f'{type(e).__name__}: {e}')
+
+    if optional:
+        # 每日盲盒每轮最多一次，实物奖只提醒，不代填收件信息。
+        try:
+            ok, data = get('/lottery/chances')
+            if not ok:
+                fail('查询盲盒机会', data)
+            elif _growth_int(_growth_field(data, 'balance')) > 0:
+                drawn, result = post('/lottery/draw', {'client_token': f'u-{uuid.uuid4()}'})
+                if drawn:
+                    prize = _growth_field(result, 'prize_name') or _growth_field(result, 'prize') or '未知奖品'
+                    note = '（实物奖请到成长中心填写收件信息）' if (
+                        _growth_field(result, 'need_address') or _growth_field(result, 'require_address')) else ''
+                    parts.append(f'已开每日盲盒：{prize}{note}')
+                else:
+                    fail('开每日盲盒', result)
+        except Exception as e:  # noqa: BLE001
+            fail('盲盒模块', f'{type(e).__name__}: {e}')
+
+        # 旅行状态未知、在途或礼物未领时，绝不开 Buddy 或派出，避免覆盖记录。
+        if travel_state == 'idle':
+            try:
+                ok, data = get('/buddy/quota')
+                if not ok:
+                    fail('查询 Buddy 能量', data)
+                else:
+                    affordable = _growth_int(_growth_field(data, 'affordable'))
+                    max_open = _growth_int(_growth_field(data, 'max_open_count'), 1) or 1
+                    if affordable > 0:
+                        count = min(affordable, max_open)
+                        opened, result = post('/buddy/open',
+                                              {'count': count, 'client_token': f'u-{uuid.uuid4()}'})
+                        if opened:
+                            parts.append(f'已用能量开 Buddy ×{count}')
+                        else:
+                            fail('能量开 Buddy', result)
+            except Exception as e:  # noqa: BLE001
+                fail('Buddy 能量模块', f'{type(e).__name__}: {e}')
+
+            if not daily_limit:
+                try:
+                    ok, config = get('/buddy/travel/config')
+                    if not ok:
+                        fail('查询旅行配置', config)
+                    else:
+                        locations = _growth_field(config, 'locations', [])
+                        location = locations[0] if isinstance(locations, list) and locations else None
+                        if not isinstance(location, dict) or not location.get('id'):
+                            fail('派 Buddy 旅行', '没有可用旅行地点')
+                        else:
+                            departed, result = post('/buddy/travel/depart',
+                                                    {'location_id': location.get('id')})
+                            if departed:
+                                parts.append('已派 Buddy 旅行')
+                            elif 'no active buddy' in str(result).lower():
+                                parts.append('派 Buddy 旅行跳过：尚未领养 Buddy')
+                            else:
+                                fail('派 Buddy 旅行', result)
+                except Exception as e:  # noqa: BLE001
+                    fail('派 Buddy 模块', f'{type(e).__name__}: {e}')
+
+    return ok_all, '成长中心：' + ('；'.join(parts) if parts else '无可领取项')
 
 
 def _pick_expire_ms(a: dict):
@@ -1258,8 +1605,9 @@ def local_usage_stats():
             'today_ctx': today_ctx, 'total_ctx': total_ctx, 'sessions': n_sessions}
 
 
-def auto_checkin_all(log):
-    """所有已登记账号执行签到（幂等）。"""
+def auto_checkin_all(log, cfg=None):
+    """所有已登记账号执行签到和成长中心任务；两类失败互不影响。"""
+    cfg = load_config() if cfg is None else cfg
     kp = get_protector_key(log)
     if not kp:
         return False
@@ -1276,6 +1624,12 @@ def auto_checkin_all(log):
         except Exception as e:  # noqa: BLE001
             log(f"{p.display}：签到失败 {e}")
             ok_all = False
+        try:
+            growth_ok, growth_msg = growth_center(
+                p, optional=bool(cfg.get("growth_optional", False)), log=log)
+            log(f"{p.display}：{growth_msg}" + ("" if growth_ok else "（不影响签到结果）"))
+        except Exception as e:  # noqa: BLE001
+            log(f"{p.display}：成长中心异常 {e}（不影响签到结果）")
     refresh_wb_ui(log)
     return ok_all
 
@@ -1421,7 +1775,14 @@ def set_auto_schedule(enable: bool, log=print) -> bool:
                            capture_output=True, text=True, errors="replace",
                            creationflags=CREATE_NO_WINDOW)
         ok = r.returncode == 0
-        log("已创建每日 09:05 自动签到任务（最高权限，可无人值守打补丁）。" if ok
+        if ok:
+            # 开启「错过开始时间后尽快运行」：电脑关机/睡眠错过 09:05 时，
+            # 开机后自动补跑，避免当天连登静默断掉（11-14 断登的教训）。
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                            f"Set-ScheduledTask -TaskName '{tn}' "
+                            f"-Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable)"],
+                           capture_output=True, creationflags=CREATE_NO_WINDOW)
+        log("已创建每日 09:05 自动签到任务（最高权限，可无人值守打补丁，错过自动补跑）。" if ok
             else f"创建任务失败：{(r.stderr or r.stdout).strip()}")
         return ok
     r = subprocess.run(["schtasks", "/Delete", "/TN", tn, "/F"],
@@ -2356,7 +2717,7 @@ def run_cli(argv: list[str]) -> int:
         # 卡片未出现时流程内部已用 API 兜底
         ensure_all_daily_sessions(sw.cfg, log)
         # 清扫：循环未覆盖的账号（如今天已保活但还没签到）用 API 补签（幂等）
-        ok = auto_checkin_all(log)
+        ok = auto_checkin_all(log, sw.cfg)
         benefit_snapshot(log)  # 顺手刷新主页面提醒条的缓存
         snapshot_usage_history()  # 记录当日积分快照（次日差值算精确日消耗）
         if sw.cfg.get("token_refresh", True):
@@ -2463,6 +2824,9 @@ def run_gui() -> None:
     except tk.TclError:
         pass
 
+    # ---- 外观主题选择（叠放在标签栏右侧，与「使用统计」并排）
+    theme_var = tk.StringVar(value=str(sw.cfg.get("theme") or "浅色"))
+
     # ---- 标签页：账号切换 / 积分签到 / 使用统计（不再另开独立窗口）
     nb = ttk.Notebook(root)
     nb.pack(fill="both", expand=True, padx=6, pady=(6, 0))
@@ -2472,6 +2836,15 @@ def run_gui() -> None:
     nb.add(tab_main, text="  账号切换  ")
     nb.add(tab_benefit, text="  积分 / 签到  ")
     nb.add(tab_usage, text="  使用统计  ")
+
+    hdr = ttk.Frame(nb)
+    ttk.Label(hdr, text="外观").pack(side="left")
+    cb_theme = ttk.Combobox(hdr, textvariable=theme_var, values=list(THEME_NAMES),
+                            state="readonly", width=9)
+    cb_theme.pack(side="left", padx=(6, 0))
+    cb_theme.bind("<<ComboboxSelected>>",
+                  lambda _e: apply_theme(theme_var.get(), persist=True, rebuild=True))
+    hdr.place(relx=1.0, x=-10, y=5, anchor="ne")  # 与标签栏同一行、靠右
 
     # 两个数据页只构建一次，之后切回时只刷新数据（带 TTL，避免频繁切页重复请求接口）
     tab_cache = {"benefit": None, "usage": None}
@@ -2524,15 +2897,15 @@ def run_gui() -> None:
     status_var = tk.StringVar(value="读取状态中…")
     ttk.Label(top, textvariable=status_var, font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
     detail_var = tk.StringVar(value="")
-    ttk.Label(top, textvariable=detail_var, foreground="#666").pack(anchor="w")
+    ttk.Label(top, textvariable=detail_var, style="Muted.TLabel").pack(anchor="w")
 
     # ---- 积分提醒条（主页面一眼可见，点击打开积分面板）
     banner = tk.Text(top, height=2, wrap="word", relief="flat", bd=0, highlightthickness=0,
                      cursor="hand2", font=("Microsoft YaHei UI", 9), bg=root.cget('bg'))
     banner.pack(fill="x", pady=(4, 0))
-    banner.tag_configure("red", foreground="#c0392b")
-    banner.tag_configure("orange", foreground="#d68910")
-    banner.tag_configure("gray", foreground="#888")
+    banner.tag_configure("red", foreground=palette()["warn"])
+    banner.tag_configure("orange", foreground=palette()["mid"])
+    banner.tag_configure("gray", foreground=palette()["muted"])
     banner.configure(state="disabled")
     banner.bind("<Button-1>", lambda e: show_tab(1))
 
@@ -2710,9 +3083,85 @@ def run_gui() -> None:
         logbox.insert("end", msg + "\n")
         if level == "error":
             logbox.tag_add("err", "end-2l", "end-1l")
-            logbox.tag_configure("err", foreground="#c0392b")
+            logbox.tag_configure("err", foreground=palette()["warn"])
         logbox.see("end")
         logbox.configure(state="disabled")
+
+    def apply_theme(name: str, persist: bool = False, rebuild: bool = False) -> None:
+        """应用外观主题：浅色 / 深色 / 跟随系统（深色用 clam 主题重绘 ttk 控件）。"""
+        global CUR_PAL
+        theme_var.set(name)
+        key = resolve_theme(name)
+        CUR_PAL = dict(PALETTES[key])
+        pal = CUR_PAL
+        try:
+            style.theme_use("clam" if key == "dark" else "vista")
+        except tk.TclError:
+            pass
+        root.configure(bg=pal["bg"])
+        style.configure(".", background=pal["bg"], foreground=pal["fg"],
+                        fieldbackground=pal["field"], bordercolor=pal["border"],
+                        lightcolor=pal["bg"], darkcolor=pal["bg"],
+                        troughcolor=pal["field"], insertcolor=pal["fg"],
+                        selectbackground=pal["sel_bg"], selectforeground=pal["sel_fg"])
+        style.configure("TFrame", background=pal["bg"])
+        style.configure("TLabel", background=pal["bg"], foreground=pal["fg"])
+        style.configure("Muted.TLabel", background=pal["bg"], foreground=pal["muted"])
+        style.configure("Ok.TLabel", background=pal["bg"], foreground=pal["ok"])
+        style.configure("TLabelframe", background=pal["bg"], bordercolor=pal["border"])
+        style.configure("TLabelframe.Label", background=pal["bg"], foreground=pal["fg"])
+        style.configure("TButton", background=pal["btn"], foreground=pal["fg"],
+                        bordercolor=pal["border"], padding=(8, 3))
+        style.map("TButton",
+                  background=[("pressed", pal["btn_active"]), ("active", pal["btn_hover"])],
+                  foreground=[("disabled", pal["muted"])])
+        style.configure("TNotebook", background=pal["bg"], bordercolor=pal["border"])
+        style.configure("TNotebook.Tab", background=pal["tab"], foreground=pal["fg"],
+                        padding=(12, 5))
+        style.map("TNotebook.Tab",
+                  background=[("selected", pal["bg"]), ("active", pal["btn_hover"])],
+                  foreground=[("selected", pal["fg"])])
+        style.configure("Treeview", background=pal["field"], fieldbackground=pal["field"],
+                        foreground=pal["fg"], bordercolor=pal["border"], rowheight=24)
+        style.map("Treeview", background=[("selected", pal["sel_bg"])],
+                  foreground=[("selected", pal["sel_fg"])])
+        style.configure("Treeview.Heading", background=pal["tab"], foreground=pal["fg"],
+                        bordercolor=pal["border"])
+        style.map("Treeview.Heading", background=[("active", pal["btn_hover"])])
+        style.configure("TEntry", fieldbackground=pal["field"], foreground=pal["fg"],
+                        insertcolor=pal["fg"], bordercolor=pal["border"])
+        style.configure("TCombobox", fieldbackground=pal["field"], background=pal["btn"],
+                        foreground=pal["fg"], arrowcolor=pal["fg"],
+                        bordercolor=pal["border"])
+        style.map("TCombobox", fieldbackground=[("readonly", pal["field"])],
+                  foreground=[("readonly", pal["fg"])])
+        style.configure("TCheckbutton", background=pal["bg"], foreground=pal["fg"])
+        style.map("TCheckbutton", background=[("active", pal["bg"])],
+                  foreground=[("disabled", pal["muted"])])
+        style.configure("TRadiobutton", background=pal["bg"], foreground=pal["fg"])
+        style.configure("TScrollbar", background=pal["btn"], troughcolor=pal["bg"],
+                        bordercolor=pal["border"], arrowcolor=pal["fg"])
+        # 非 ttk 控件：积分提醒条 / 日志框
+        banner.configure(bg=pal["bg"], fg=pal["fg"], insertbackground=pal["fg"])
+        banner.tag_configure("red", foreground=pal["warn"])
+        banner.tag_configure("orange", foreground=pal["mid"])
+        banner.tag_configure("gray", foreground=pal["muted"])
+        logbox.configure(bg=pal["log_bg"], fg=pal["fg"], insertbackground=pal["fg"])
+        logbox.tag_configure("err", foreground=pal["warn"])
+        if persist:
+            sw.cfg["theme"] = name
+            save_config(sw.cfg)
+        if rebuild:
+            # 数据页里有画布等固定色控件：清掉后按新主题重建
+            for tab in (tab_benefit, tab_usage):
+                for w in tab.winfo_children():
+                    w.destroy()
+            tab_cache["benefit"] = None
+            tab_cache["usage"] = None
+            try:
+                on_tab_changed()
+            except tk.TclError:
+                pass
 
     def save_opts() -> None:
         sw.cfg["share_sidebar"] = bool(share_sidebar_var.get())
@@ -2845,7 +3294,52 @@ def run_gui() -> None:
 
     # ---- 运行期后台任务：每 auto_checkin_interval 分钟补签 + 每日令牌保活
     # 线程里不能直接动 Tk，统一经 q 投递回主线程（info/banner 分支已存在）。
-    _auto = {"next_checkin": time.time() + 90, "refresh_day": None}
+    _auto = {"next_checkin": time.time() + 90, "refresh_day": None,
+             "keepalive_warn_day": None, "tz_warn_day": None}
+
+    def keepalive_catchup():
+        """每日连登兜底：活跃地图要求「当天真实完成一次对话」，纯 API 签到不算。
+        只有 ensure_all_daily_sessions 能产生对话，而它原本只在一键签到/09:05 定时跑，
+        定时任务一旦失败就会断登。这里加一层常驻兜底：
+        凌晨（0~7 点，无人使用）自动补一次保活会话；白天只提醒、不强制切号打断。"""
+        if not sw.cfg.get("keepalive", True) or busy["flag"]:
+            return
+        today = datetime.now().strftime('%Y-%m-%d')
+        state = load_keepalive_state()
+        todo = [p for p in load_profiles().values()
+                if state.get(p.uid, {}).get("date") != today]
+        if not todo:
+            return
+        hour = datetime.now().hour
+        if 0 <= hour < 7:
+            def job():
+                try:
+                    ensure_all_daily_sessions(sw.cfg, lambda m: q.put(("info", m)))
+                    root.after(0, refresh)
+                except Exception as e:  # noqa: BLE001
+                    q.put(("error", f"（连登兜底）保活出错：{e}"))
+            threading.Thread(target=job, daemon=True).start()
+        elif _auto.get("keepalive_warn_day") != today:
+            _auto["keepalive_warn_day"] = today
+            q.put(("info", f"（连登提醒）{'、'.join(p.display for p in todo)} 今天还没有会话，"
+                           "活跃地图可能断登；点「一键签到」立即补齐，或等今晚凌晨自动补。"))
+
+    def timezone_check():
+        """系统时区若非 UTC+8，会使本地日期与 WB 服务器（UTC+8）错位，
+        跨午夜时段的签到/对话被记到次日，导致活跃地图显示断登。按天提醒一次。"""
+        today = datetime.now().strftime('%Y-%m-%d')
+        if _auto.get("tz_warn_day") == today:
+            return
+        try:
+            off = datetime.now().astimezone().utcoffset()
+            if off is not None and abs(off.total_seconds() - 8 * 3600) > 60:
+                _auto["tz_warn_day"] = today
+                hours = off.total_seconds() / 3600
+                q.put(("error", f"⚠ 系统时区为 UTC{hours:+g}，不是 UTC+8！"
+                               "这会导致签到/连登日期与服务器错位（曾因此断登）。"
+                               "请在 Windows 设置→时间和语言→日期和时间改回「(UTC+08:00) 北京」。"))
+        except Exception:  # noqa: BLE001
+            pass
 
     def catchup_checkin():
         def job():
@@ -2855,12 +3349,16 @@ def run_gui() -> None:
                 for p in load_profiles().values():
                     try:
                         ok, data = checkin_status(p, log=lambda m: None)
-                        if ok and isinstance(data, dict) and data.get('today_checked_in'):
-                            continue  # 已签，不打扰
-                        _, msg = daily_checkin(p, log=lambda m: None)
-                        q.put(("info", f"（自动补签）{p.display}：{msg}"))
+                        if not (ok and isinstance(data, dict) and data.get('today_checked_in')):
+                            _, msg = daily_checkin(p, log=lambda m: None)
+                            q.put(("info", f"（自动补签）{p.display}：{msg}"))
+                        growth_ok, growth_msg = growth_center(
+                            p, optional=bool(sw.cfg.get("growth_optional", False)), log=lambda m: None)
+                        if growth_msg != "成长中心：无可领取项":
+                            q.put(("info" if growth_ok else "error",
+                                   f"（成长中心）{p.display}：{growth_msg}"))
                     except Exception as e:  # noqa: BLE001
-                        q.put(("error", f"（自动补签）{p.display}：{e}"))
+                        q.put(("error", f"（自动补签/成长中心）{p.display}：{e}"))
                 q.put(("banner", benefit_snapshot(lambda m: None)))
             except Exception as e:  # noqa: BLE001
                 q.put(("error", f"（自动补签）任务出错：{e}"))
@@ -2911,6 +3409,10 @@ def run_gui() -> None:
                 if _auto["refresh_day"] != today and sw.cfg.get("token_refresh", True):
                     _auto["refresh_day"] = today
                     token_refresh_check()
+                timezone_check()
+                if time.time() >= _auto.get("next_keepalive", 0):
+                    _auto["next_keepalive"] = time.time() + 300  # 每 5 分钟检查一次连登
+                    keepalive_catchup()
         except Exception:  # noqa: BLE001  定时循环自身绝不能死
             pass
         root.after(60_000, auto_tick)
@@ -3105,6 +3607,7 @@ def run_gui() -> None:
 
     root.protocol("WM_DELETE_WINDOW", on_close)
 
+    apply_theme(theme_var.get())
     refresh()
     refresh_banner_async()
     start_tray()
@@ -3243,7 +3746,7 @@ def build_benefits_tab(host, sw):
     cols1 = ("alias", "checked", "streak", "week", "total")
     tv1 = ttk.Treeview(win, columns=cols1, show="headings", height=4)
     for cid, t, w in [("alias", "账号", 110), ("checked", "今日签到", 80), ("streak", "连续天数", 80),
-                      ("week", "本周签到", 80), ("total", "总积分", 90)]:
+                      ("week", "本周签到", 80), ("total", "可用积分", 90)]:
         tv1.heading(cid, text=t)
         tv1.column(cid, width=w, anchor="w")
     tv1.pack(fill="x", padx=12)
@@ -3260,9 +3763,9 @@ def build_benefits_tab(host, sw):
         tv2.column(cid, width=w, anchor="w")
     tv2sb = ttk.Scrollbar(tv2wrap, orient="vertical", command=tv2.yview)
     tv2.configure(yscrollcommand=tv2sb.set)
-    tv2.tag_configure('red', foreground='#c0392b')
-    tv2.tag_configure('orange', foreground='#d68910')
-    tv2.tag_configure('toggle', foreground='#2471a3')
+    tv2.tag_configure('red', foreground=palette()['warn'])
+    tv2.tag_configure('orange', foreground=palette()['mid'])
+    tv2.tag_configure('toggle', foreground=palette()['link'])
     tv2.pack(side="left", fill="both", expand=True)
     tv2sb.pack(side="right", fill="y")
 
@@ -3303,7 +3806,7 @@ def build_benefits_tab(host, sw):
     tv2.bind("<Button-1>", on_tv2_click)
 
     stats_var = tk.StringVar(value="本地用量统计：刷新后显示")
-    ttk.Label(win, textvariable=stats_var, foreground="#555").pack(anchor="w", padx=12, pady=4)
+    ttk.Label(win, textvariable=stats_var, style="Muted.TLabel").pack(anchor="w", padx=12, pady=4)
 
     btns = ttk.Frame(win)
     btns.pack(fill="x", padx=12, pady=(2, 4))
@@ -3352,6 +3855,9 @@ def build_benefits_tab(host, sw):
             pass
         except tk.TclError:
             return  # 页面已切走/销毁，结束轮询
+        # 页面停留期间积分仍会消耗；可见时每 5 分钟刷新，避免长期显示旧批次。
+        if not busy["f"] and win.winfo_ismapped() and time.time() - last_upd["at"] >= 300:
+            refresh_data()
         try:
             win.after(150, poll)
         except tk.TclError:
@@ -3388,15 +3894,17 @@ def build_benefits_tab(host, sw):
                 return
             for p in load_profiles().values():
                 ok, st = checkin_status(p, log=L)
+                packs = resource_summary(p, log=L)
+                # total_credits 是累计签到所得，不是余额；可用积分以校正后的有效批次余量合计为准。
+                available = f"{sum(pk['remain'] for pk in packs):g}" if packs is not None else "-"
                 if ok:
                     q.put(("row1", (p.display,
                                     "✓ 已签到" if st.get("today_checked_in") else "未签到",
                                     st.get("streak_days", 0),
                                     st.get("week_checkin_days", 0),
-                                    st.get("total_credits", 0))))
+                                    available)))
                 else:
-                    q.put(("row1", (p.display, "令牌失效/错误", "-", "-", "-")))
-                packs = resource_summary(p, log=L)
+                    q.put(("row1", (p.display, "令牌失效/错误", "-", "-", available)))
                 if packs:
                     def _pack_vals(pk):
                         exp, days, tag = "-", "-", ""
@@ -3452,7 +3960,7 @@ def build_benefits_tab(host, sw):
             # 先走逐账号流程：卡片领取优先（按钮同步为已领取）+ 连签保活
             ensure_all_daily_sessions(sw.cfg, L)
             # 清扫：循环未覆盖的账号用 API 补签（幂等）
-            auto_checkin_all(L)
+            auto_checkin_all(L, sw.cfg)
             q.put(("refresh", ""))  # 交给主线程轮询统一刷新，避免跨线程操作控件
         worker(job)
 
@@ -3462,6 +3970,13 @@ def build_benefits_tab(host, sw):
         q.put(("log", "连签保障已开启：签到后会为无会话账号自动发起最小保活会话。"
                 if sw.cfg["keepalive"] else
                 "连签保障已关闭：不再自动发起保活会话。"))
+
+    def toggle_growth_optional():
+        sw.cfg["growth_optional"] = bool(growth_optional_var.get())
+        save_config(sw.cfg)
+        q.put(("log", "可选玩法已开启：签到时会派 Buddy 旅行、开每日盲盒、用能量开 Buddy，"
+                      "并在确认断登时最多补登一天。" if sw.cfg["growth_optional"] else
+                      "可选玩法已关闭：上述操作均不会执行；稳妥版接任务和领奖不受影响。"))
 
     def toggle_schedule():
         try:
@@ -3481,10 +3996,19 @@ def build_benefits_tab(host, sw):
     auto_check.pack(side="left", padx=(16, 0))
     keepalive_check.pack(side="left", padx=(16, 0))
 
+    growth_row = ttk.Frame(win)
+    growth_row.pack(fill="x", padx=12, pady=(0, 4))
+    growth_optional_var = tk.BooleanVar(value=bool(sw.cfg.get("growth_optional", False)))
+    growth_optional_check = ttk.Checkbutton(
+        growth_row, text="启用可选玩法（派 Buddy 旅行、每日盲盒、能量开 Buddy、断登补登）",
+        variable=growth_optional_var, command=toggle_growth_optional)
+    growth_optional_check.pack(side="left")
+    ttk.Label(growth_row, text="不勾选时不会执行这些玩法", style="Muted.TLabel").pack(side="left", padx=(12, 0))
+
     log_var = tk.StringVar(value="就绪。")
-    ttk.Label(win, textvariable=log_var, foreground="#0a7").pack(anchor="w", padx=12)
+    ttk.Label(win, textvariable=log_var, style="Ok.TLabel").pack(anchor="w", padx=12)
     upd_var = tk.StringVar(value="")
-    ttk.Label(win, textvariable=upd_var, foreground="#888").pack(anchor="w", padx=12, pady=(0, 8))
+    ttk.Label(win, textvariable=upd_var, style="Muted.TLabel").pack(anchor="w", padx=12, pady=(0, 8))
 
     btn_checkin.configure(command=do_checkin)
     refresh_data(True)
@@ -3516,18 +4040,18 @@ def build_usage_tab(host):
         cards.columnconfigure(i, weight=1)
         ttk.Label(cell, textvariable=var, font=("Microsoft YaHei UI", 13, "bold"),
                   anchor="center").pack(fill="x")
-        ttk.Label(cell, text=small, foreground="#666", anchor="center").pack(fill="x")
+        ttk.Label(cell, text=small, style="Muted.TLabel", anchor="center").pack(fill="x")
 
     burn_var = tk.StringVar(value="")
-    ttk.Label(win, textvariable=burn_var, foreground="#555").pack(anchor="w", padx=12, pady=(4, 0))
+    ttk.Label(win, textvariable=burn_var, style="Muted.TLabel").pack(anchor="w", padx=12, pady=(4, 0))
     upd_var = tk.StringVar(value="")
-    ttk.Label(win, textvariable=upd_var, foreground="#888").pack(anchor="w", padx=12)
+    ttk.Label(win, textvariable=upd_var, style="Muted.TLabel").pack(anchor="w", padx=12)
 
     # ---- 活动热力图（近 12 周，按每日 Token）
     ttk.Label(win, text="活动热力图（近 12 周 · 按每日 Token 用量）", font=("Microsoft YaHei UI", 10, "bold")
               ).pack(anchor="w", padx=12, pady=(10, 2))
-    HM = tk.Canvas(win, width=820, height=7 * 22 + 26, bg="#fbfbfb", highlightthickness=1,
-                   highlightbackground="#e0e0e0")
+    HM = tk.Canvas(win, width=820, height=7 * 22 + 26, bg=palette()["canvas"], highlightthickness=1,
+                   highlightbackground=palette()["border"])
     HM.pack(fill="x", padx=12)
     cell_w, gap = 20, 3
 
@@ -3540,12 +4064,11 @@ def build_usage_tab(host):
         max_tok = max((v['tokens'] for v in daily.values()), default=0) or 1
 
         def heat_color(v):
+            pal = palette()
             if v <= 0:
-                return "#ececec"
+                return pal["heat_empty"]
             t = min(v / max_tok, 1.0)
-            return (f"#{int(0xec + t*(0x2f-0xec)):02x}"
-                    f"{int(0xed + t*(0x81-0xed)):02x}"
-                    f"{int(0xf0 + t*(0xf7-0xf0)):02x}")
+            return hex_mix(pal["heat_empty"], pal["accent"], t)
 
         month_marks = []
         for col in range(12):
@@ -3562,7 +4085,7 @@ def build_usage_tab(host):
             if ds.day <= 7 and ds != start:
                 month_marks.append((8 + col * (cell_w + gap), f"{ds.month}月"))
         for x, label in month_marks:
-            HM.create_text(x + 10, 7 * (cell_w + gap) + 10, text=label, fill="#888",
+            HM.create_text(x + 10, 7 * (cell_w + gap) + 10, text=label, fill=palette()["muted"],
                            font=("Microsoft YaHei UI", 8))
 
     # ---- 每日趋势图（近 7 / 30 日，Token 折线 + 积分折线）
@@ -3570,8 +4093,8 @@ def build_usage_tab(host):
     bar.pack(fill="x", padx=12, pady=(10, 2))
     ttk.Label(bar, text="每日趋势", font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
     trend_range = {"days": 7}
-    TR = tk.Canvas(win, width=820, height=300, bg="#fbfbfb", highlightthickness=1,
-                   highlightbackground="#e0e0e0")
+    TR = tk.Canvas(win, width=820, height=300, bg=palette()["canvas"], highlightthickness=1,
+                   highlightbackground=palette()["border"])
     TR.pack(fill="x", padx=12, pady=(0, 8))
     trend_state = {'items': [], 'data': None}
 
@@ -3592,29 +4115,29 @@ def build_usage_tab(host):
         def py_c(v): return T + plot_h * (1 - v / max_c)
         for g in range(5):
             y = T + plot_h * g / 4
-            TR.create_line(L, y, W - R, y, fill="#e8e8e8")
+            TR.create_line(L, y, W - R, y, fill=palette()["grid"])
         # Token 折线（蓝）
         pts = [(px(i), py_t(v)) for i, v in enumerate(toks)]
         if n > 1:
-            TR.create_line(*[c for p in pts for c in p], fill="#2f81f7", width=2, smooth=True)
+            TR.create_line(*[c for p in pts for c in p], fill=palette()["accent"], width=2, smooth=True)
         for i, (x, y) in enumerate(pts):
-            TR.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#2f81f7", outline="")
+            TR.create_oval(x - 3, y - 3, x + 3, y + 3, fill=palette()["accent"], outline="")
         # 积分折线（橙）
         pts_c = [(px(i), py_c(v)) for i, v in enumerate(creds)]
         if n > 1:
-            TR.create_line(*[c for p in pts_c for c in p], fill="#e67e22", width=2, smooth=True)
+            TR.create_line(*[c for p in pts_c for c in p], fill=palette()["accent2"], width=2, smooth=True)
         for i, (x, y) in enumerate(pts_c):
-            TR.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#e67e22", outline="")
+            TR.create_oval(x - 3, y - 3, x + 3, y + 3, fill=palette()["accent2"], outline="")
         # 轴标签
-        TR.create_text(L - 6, T + 4, text=f"{max_t:,}", anchor="e", fill="#2f81f7", font=("Consolas", 8))
-        TR.create_text(L - 6, T + plot_h, text="0", anchor="e", fill="#888", font=("Consolas", 8))
-        TR.create_text(W - R + 4, T + 4, text=f"{max_c:g} 分", anchor="w", fill="#e67e22", font=("Microsoft YaHei UI", 8))
+        TR.create_text(L - 6, T + 4, text=f"{max_t:,}", anchor="e", fill=palette()["accent"], font=("Consolas", 8))
+        TR.create_text(L - 6, T + plot_h, text="0", anchor="e", fill=palette()["muted"], font=("Consolas", 8))
+        TR.create_text(W - R + 4, T + 4, text=f"{max_c:g} 分", anchor="w", fill=palette()["accent2"], font=("Microsoft YaHei UI", 8))
         step = max(1, n // 7)
         for i in range(0, n, step):
             TR.create_text(px(i), H - Bm + 16, text=dates[i][5:].replace('-', '/'),
-                           fill="#888", font=("Microsoft YaHei UI", 8))
-        TR.create_text(L + 8, T - 12, text="● Token（上下文）", fill="#2f81f7", anchor="w", font=("Microsoft YaHei UI", 8))
-        TR.create_text(L + 130, T - 12, text="● 积分消耗", fill="#e67e22", anchor="w", font=("Microsoft YaHei UI", 8))
+                           fill=palette()["muted"], font=("Microsoft YaHei UI", 8))
+        TR.create_text(L + 8, T - 12, text="● Token（上下文）", fill=palette()["accent"], anchor="w", font=("Microsoft YaHei UI", 8))
+        TR.create_text(L + 130, T - 12, text="● 积分消耗", fill=palette()["accent2"], anchor="w", font=("Microsoft YaHei UI", 8))
         trend_state['data'] = {'dates': dates, 'toks': toks, 'creds': creds,
                                'px': [px(i) for i in range(n)],
                                'pyt': [py_t(v) for v in toks],
@@ -3641,9 +4164,9 @@ def build_usage_tab(host):
         if bd > 32:
             return
         x, yt, yc = d['px'][best], d['pyt'][best], d['pyc'][best]
-        trend_state['items'].append(TR.create_line(x, d['top'], x, d['bottom'], fill="#bbb", dash=(3, 3)))
-        trend_state['items'].append(TR.create_oval(x - 5, yt - 5, x + 5, yt + 5, outline="#2f81f7", width=2))
-        trend_state['items'].append(TR.create_oval(x - 5, yc - 5, x + 5, yc + 5, outline="#e67e22", width=2))
+        trend_state['items'].append(TR.create_line(x, d['top'], x, d['bottom'], fill=palette()["muted"], dash=(3, 3)))
+        trend_state['items'].append(TR.create_oval(x - 5, yt - 5, x + 5, yt + 5, outline=palette()["accent"], width=2))
+        trend_state['items'].append(TR.create_oval(x - 5, yc - 5, x + 5, yc + 5, outline=palette()["accent2"], width=2))
         txt = (f"{d['dates'][best][5:].replace('-', '/')}\n"
                f"积分 {d['creds'][best]:g}\n"
                f"Token {d['toks'][best]:,}")
@@ -3653,9 +4176,11 @@ def build_usage_tab(host):
         if by < 2:
             by = max(yt, yc) + 10
         trend_state['items'].append(TR.create_rectangle(bx, by, bx + bw, by + bh,
-                                                        fill="#ffffff", outline="#999"))
+                                                        fill=palette()["field"],
+                                                        outline=palette()["border"]))
         trend_state['items'].append(TR.create_text(bx + 8, by + 5, text=txt, anchor="nw",
-                                                   font=("Microsoft YaHei UI", 8), fill="#333"))
+                                                   font=("Microsoft YaHei UI", 8),
+                                                   fill=palette()["fg"]))
 
     def on_leave(e):
         for iid in trend_state['items']:
@@ -3683,7 +4208,7 @@ def build_usage_tab(host):
     ttk.Label(win, text=(f"注：{n_acc} 个账号共用同一份会话库，统计为合并值。"
                          "积分日消耗按每笔请求的真实发生时间（UUIDv7 时间戳）归档；"
                          "Token 按会话最后活跃日归档。"),
-              foreground="#888", wraplength=820, justify="left").pack(anchor="w", padx=12, pady=(0, 8))
+              style="Muted.TLabel", wraplength=820, justify="left").pack(anchor="w", padx=12, pady=(0, 8))
 
     def refresh(force=False):
         """重算统计并就地更新指标卡/热力图/趋势图；非强制时 30 秒内复用上次结果。"""

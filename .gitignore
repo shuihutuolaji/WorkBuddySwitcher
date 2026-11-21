@@ -10,3 +10,6 @@ dist/
 nul
 Thumbs.db
 .DS_Store
+
+# Generated icon preview (make_icon.py)
+icon_preview.png
